@@ -100,7 +100,11 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 	if l.stabled == l.LastIndex() {
 		return []pb.Entry{}
 	}
-	return l.entries[l.stabled+1-l.FirstIndex():]
+	ents, err := l.slice(l.stabled+1, l.LastIndex()+1)
+	if err != nil {
+		panic(err)
+	}
+	return ents
 }
 
 // nextEnts returns all the committed but not applied entries
@@ -115,6 +119,10 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 		}
 	}
 	return ents
+}
+
+func (l *RaftLog) hasPendingSnapshot() bool {
+	return l.pendingSnapshot != nil && !IsEmptySnap(l.pendingSnapshot)
 }
 
 // FirstIndex return the first index of the log entries
@@ -271,6 +279,22 @@ func (l *RaftLog) appliedTo(to uint64) {
 	l.applied = to
 }
 
+func (l *RaftLog) stableSnapshotTo(to uint64) {
+	if l.pendingSnapshot != nil && l.pendingSnapshot.Metadata.Index == to {
+		l.pendingSnapshot = nil
+	}
+}
+
+func (l *RaftLog) stableTo(to, term uint64) {
+	t, err := l.Term(to)
+	if err != nil {
+		panic(err)
+	}
+	if t == term && to > l.stabled {
+		l.stabled = to
+	}
+}
+
 func (l *RaftLog) slice(lo, hi uint64) ([]pb.Entry, error) {
 	offset := l.FirstIndex()
 	if lo < offset {
@@ -293,6 +317,15 @@ func (l *RaftLog) zeroTermOnErrCompacted(t uint64, err error) uint64 {
 	return 0
 }
 
+//
+// accelerated log backtracking optimization from 
+// https://thesquareplanet.com/blog/students-guide-to-raft/#an-aside-on-optimizations
+//
+// 1. if a follower does not have prevIndex int its log, it returns with
+// conflictIndex = len(log) and conflictTerm = 0
+// 2. if follower does have prevIndex in its log, but the term does not
+// match, the it should set conflictTerm = log[prevIndex].Term, and search
+// its log for the first index whose term = conflictTerm
 func (l *RaftLog) fellowerFastRollBack(prevIndex, prevTerm uint64) (conflictIndex, conflictTerm uint64) {
 	lastIndex := l.LastIndex()
 	if prevIndex > lastIndex {
@@ -309,15 +342,21 @@ func (l *RaftLog) fellowerFastRollBack(prevIndex, prevTerm uint64) (conflictInde
 	return conflictIndex, conflictTerm
 }
 
+// 1. leader should search its log for conflictTerm, if it finds an entry with that
+// term, it will set nextIndex to the first index whose term > conflictTerm.
+// 2. if it does not find one, set nextIndex = fonflictIndex.
 func (l *RaftLog) leaderFastRollBack(conflictIndex, conflictTerm uint64) (nextIndex uint64) {
 	if conflictTerm == 0 {
 		nextIndex = conflictIndex
 	} else {
 		firstIndex := l.FirstIndex()
 		for nextIndex = conflictIndex; nextIndex > firstIndex; nextIndex-- {
-			if l.zeroTermOnErrCompacted(l.Term(nextIndex-1)) <= conflictTerm {
-				break
+			if term := l.zeroTermOnErrCompacted(l.Term(nextIndex - 1)); term > conflictTerm {
+				continue
+			} else if term < conflictTerm {
+				nextIndex = conflictIndex
 			}
+			break
 		}
 	}
 	return nextIndex

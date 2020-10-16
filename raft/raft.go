@@ -260,6 +260,31 @@ func (r *Raft) sendAppend(to uint64) bool {
 	return true
 }
 
+func (r *Raft) softState() *SoftState {
+	return &SoftState{Lead: r.Lead, RaftState: r.State}
+}
+
+func (r *Raft) hardState() pb.HardState {
+	return pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.committed,
+	}
+}
+
+func (r *Raft) advance(rd Ready) {
+	if len(rd.Entries) > 0 {
+		last := rd.Entries[len(rd.Entries)-1]
+		r.RaftLog.stableTo(last.Index, last.Term)
+	}
+	if !IsEmptySnap(&rd.Snapshot) {
+		r.RaftLog.stableSnapshotTo(rd.Snapshot.Metadata.Index)
+	}
+	if applied := rd.appliedCursor(); applied > 0 {
+		r.RaftLog.appliedTo(applied)
+	}
+}
+
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
